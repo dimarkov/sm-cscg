@@ -35,6 +35,40 @@ def _log_normalize(v):
     return v - logsumexp(v)
 
 
+def _predict_next_obs(log_T, log_pi, obs_seq, n_clones, n_obs):
+    """Predict P(x_{t+1} | x_{1:t}) for all t=0..T-1, in parallel.
+
+    Works for both CSCG (n_clones = C) and SM-CSCG (n_clones = C_eff).
+
+    Returns
+    -------
+    log_probs : jax.Array (T, n_obs)
+    """
+    obs = jnp.asarray(obs_seq, dtype=jnp.int32)
+    C = n_clones
+    N = n_obs * C
+
+    # Forward pass → filtered distributions at all timesteps
+    log_alphas_C, _ = _forward(log_T, log_pi, obs, C)  # (T, C)
+    log_alphas_C = log_alphas_C - logsumexp(log_alphas_C, axis=1, keepdims=True)
+
+    # Gather transition blocks for each timestep's observation: (T, C, N)
+    def get_block(o):
+        return jax.lax.dynamic_slice(log_T, [o * C, 0], [C, N])
+
+    T_blocks = jax.vmap(get_block)(obs)
+
+    # Propagate all timesteps: P(s_{t+1} | x_{1:t})
+    log_pred = logsumexp(log_alphas_C[:, :, None] + T_blocks, axis=1)  # (T, N)
+
+    # Marginalize over clones per observation
+    T_len = obs.shape[0]
+    log_probs = logsumexp(log_pred.reshape(T_len, n_obs, C), axis=2)  # (T, n_obs)
+    log_probs = log_probs - logsumexp(log_probs, axis=1, keepdims=True)
+
+    return log_probs
+
+
 def _forward(log_T, log_pi, obs_seq, n_clones):
     """Forward pass in log-space using jax.lax.scan (sparse-block).
 
@@ -394,23 +428,43 @@ class CSCG(eqx.Module):
         return np.array(_viterbi(self.log_T, self.log_pi, obs, self.n_clones))
 
     def predict_next_obs(self, obs_seq):
-        """Predict next observation from Viterbi last state.
+        """Predict P(x_{t+1} | x_{1:t}) for all t, in parallel.
 
         Returns
         -------
-        pred_obs  : int
-        log_probs : jax.Array (n_obs,)
+        log_probs : jax.Array (T, n_obs)
         """
-        states     = self.decode(obs_seq)
-        last_state = int(states[-1])
-        C          = self.n_clones
-        # Reshape row of log_T into (n_obs, C), logsumexp over clones
-        log_probs  = logsumexp(
-            self.log_T[last_state].reshape(self.n_obs, C), axis=1
-        )
-        log_probs  = log_probs - logsumexp(log_probs)
-        pred_obs   = int(jnp.argmax(log_probs))
-        return pred_obs, log_probs
+        return _predict_next_obs(self.log_T, self.log_pi, obs_seq,
+                                 self.n_clones, self.n_obs)
+
+    def sample(self, length, key=None):
+        """Ancestral sampling from the model.
+
+        Parameters
+        ----------
+        length : int — number of timesteps to generate
+        key    : jax.random.PRNGKey or None
+
+        Returns
+        -------
+        obs_seq : ndarray (length,) int32
+        states  : ndarray (length,) int32
+        """
+        if key is None:
+            key = jax.random.PRNGKey(0)
+        C = self.n_clones
+
+        key, subkey = jax.random.split(key)
+        s = int(jax.random.categorical(subkey, self.log_pi))
+        states = [s]
+        for _ in range(1, length):
+            key, subkey = jax.random.split(key)
+            s = int(jax.random.categorical(subkey, self.log_T[s]))
+            states.append(s)
+
+        states = np.array(states, dtype=np.int32)
+        obs_seq = np.array(states // C, dtype=np.int32)
+        return obs_seq, states
 
     # ------------------------------------------------------------------
     # Training

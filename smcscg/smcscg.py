@@ -22,7 +22,8 @@ import numpy as np
 import time
 
 from .cscg import (_forward, _backward, _xi_sum, _viterbi, _log_normalize,
-                        _pad_sequences, _e_step_scan, _viterbi_e_step_scan)
+                        _pad_sequences, _e_step_scan, _viterbi_e_step_scan,
+                        _predict_next_obs)
 
 
 NEG_INF = -jnp.inf
@@ -32,14 +33,20 @@ NEG_INF = -jnp.inf
 # Build expanded transition matrix (in numpy, then convert to jax)
 # ---------------------------------------------------------------------------
 
-def _build_coxian_matrix(log_c, log_1mc, log_A, n_macro, n_phases):
+def _build_coxian_matrix(log_s, log_c, log_e, log_A, n_macro, n_phases):
     """Build (N_tilde, N_tilde) expanded transition matrix for Coxian phase-type.
+
+    Each phase has three options (or two for the last phase):
+      - stay in current phase (self-loop):  s[j,l]
+      - advance to next phase:              c[j,l]   (l < L-1 only)
+      - exit macro state:                   e[j,l]
 
     Parameters
     ----------
-    log_c   : (n_macro, n_phases-1) log continuation probs c[j,l]
-    log_1mc : (n_macro, n_phases-1) log exit probs 1-c[j,l]
-    log_A   : (n_macro, n_macro)    log macro-transition probs (no self-loops)
+    log_s : (n_macro, n_phases)   log stay probs
+    log_c : (n_macro, n_phases-1) log advance probs
+    log_e : (n_macro, n_phases)   log exit probs
+    log_A : (n_macro, n_macro)    log macro-transition probs (no self-loops)
     n_macro, n_phases : int
 
     Returns
@@ -53,19 +60,21 @@ def _build_coxian_matrix(log_c, log_1mc, log_A, n_macro, n_phases):
     for j in range(N):
         for l in range(L):
             jl = j * L + l
+
+            # Self-loop (stay in same phase)
+            log_tilde_A[jl, jl] = log_s[j, l]
+
+            # Advance to next phase
             if l < L - 1:
                 jl1 = j * L + l + 1
                 log_tilde_A[jl, jl1] = log_c[j, l]
-                log_e = log_1mc[j, l]
-            else:
-                log_e = 0.0  # last phase: must exit
 
-            # Inter-macro transitions (enter at phase 0)
+            # Exit: inter-macro transitions (enter at phase 0)
             for jp in range(N):
                 if jp == j:
                     continue
                 jpl0 = jp * L + 0
-                log_tilde_A[jl, jpl0] = log_e + log_A[j, jp]
+                log_tilde_A[jl, jpl0] = log_e[j, l] + log_A[j, jp]
 
     return jnp.array(log_tilde_A)
 
@@ -133,8 +142,9 @@ class SMCSCG(eqx.Module):
     log_A  : jax.Array          # (n_macro, n_macro) — no self-loops
 
     # Phase-type params (Coxian or General)
-    log_c    : jax.Array        # (n_macro, n_phases-1) — Coxian only
-    log_1mc  : jax.Array        # (n_macro, n_phases-1) — Coxian only
+    log_s    : jax.Array        # (n_macro, n_phases) — Coxian stay probs
+    log_c    : jax.Array        # (n_macro, n_phases-1) — Coxian advance probs
+    log_e    : jax.Array        # (n_macro, n_phases) — Coxian exit probs
     log_S    : jax.Array        # (n_macro, n_phases, n_phases) — General only
     log_alpha: jax.Array        # (n_macro, n_phases) — General entry dist
 
@@ -177,10 +187,17 @@ class SMCSCG(eqx.Module):
         self.log_A = log_A
 
         if phase_type == "coxian":
-            # Continuation probs uniform in [0.3, 0.8]
-            c = 0.3 + 0.5 * jax.random.uniform(keys[1], shape=(N, max(L - 1, 1)))
-            self.log_c = jnp.log(c)
-            self.log_1mc = jnp.log(1.0 - c)
+            # Three-way split per phase: stay / advance / exit
+            # For l < L-1: s + c + e = 1; for l == L-1: s + e = 1
+            raw = jax.random.exponential(keys[1], shape=(N, L, 3))
+            # Zero out advance weight for last phase
+            raw = raw.at[:, -1, 1].set(0.0)
+            row_sums = raw.sum(axis=2, keepdims=True)
+            probs = raw / row_sums  # (N, L, 3): [stay, advance, exit]
+
+            self.log_s = jnp.log(probs[:, :, 0])                # (N, L)
+            self.log_c = jnp.log(probs[:, :L - 1, 1])           # (N, L-1)
+            self.log_e = jnp.log(probs[:, :, 2])                # (N, L)
             # Unused General params (dummy)
             self.log_S = jnp.full((N, L, L), float("-inf"))
             self.log_alpha = jnp.full((N, L), -jnp.log(L))
@@ -197,8 +214,9 @@ class SMCSCG(eqx.Module):
             row_norms = logsumexp(jnp.log(raw_S), axis=2, keepdims=True)
             self.log_S = jnp.log(raw_S) - row_norms + jnp.log(stay_frac)
             # Unused Coxian params (dummy)
+            self.log_s = jnp.full((N, L), float("-inf"))
             self.log_c = jnp.full((N, max(L - 1, 1)), float("-inf"))
-            self.log_1mc = jnp.full((N, max(L - 1, 1)), 0.0)
+            self.log_e = jnp.full((N, L), 0.0)
         else:
             raise ValueError(f"Unknown phase_type: {phase_type!r}")
 
@@ -237,13 +255,14 @@ class SMCSCG(eqx.Module):
         log_A_np = np.array(self.log_A)
 
         if self.phase_type == "coxian":
+            log_s_np = np.array(self.log_s)
             log_c_np = np.array(self.log_c)
-            log_1mc_np = np.array(self.log_1mc)
-            log_tilde_A = _build_coxian_matrix(log_c_np, log_1mc_np, log_A_np, N, L)
+            log_e_np = np.array(self.log_e)
+            log_tilde_A = _build_coxian_matrix(log_s_np, log_c_np, log_e_np,
+                                               log_A_np, N, L)
             # Enter at phase 0
             log_tilde_pi = jnp.full(N * L, float("-inf"))
-            for j in range(N):
-                log_tilde_pi = log_tilde_pi.at[j * L].set(self.log_pi[j])
+            log_tilde_pi = log_tilde_pi.at[jnp.arange(N) * L].set(self.log_pi)
         else:
             log_S_np = np.array(self.log_S)
             log_alpha_np = np.array(self.log_alpha)
@@ -306,46 +325,14 @@ class SMCSCG(eqx.Module):
         return macro_states, segments
 
     def predict_next_obs(self, obs_seq):
-        """Predict next observation from Viterbi last expanded state.
+        """Predict P(x_{t+1} | x_{1:t}) for all t, in parallel.
 
         Returns
         -------
-        pred_obs  : int
-        log_probs : ndarray (n_obs,)
+        log_probs : jax.Array (T, n_obs)
         """
-        macro_states, _ = self.decode(obs_seq)
-        last_macro = int(macro_states[-1])
-        L = self.n_phases
-        C = self.n_clones
-        N = self.n_macro
-
-        # Marginalize from last expanded state (phase 0 entry for next macro)
-        # Aggregate exit transitions from last macro-state
-        log_probs = []
-        for o in range(self.n_obs):
-            # Clones for obs o: macro-states o*C .. (o+1)*C - 1
-            # Their phase-0 expanded states
-            log_p = float("-inf")
-            for k in range(C):
-                jp = o * C + k
-                if jp == last_macro:
-                    continue
-                # Sum over exit phases from last_macro
-                for l in range(L):
-                    jl = last_macro * L + l
-                    jpl0 = jp * L + 0
-                    if self.phase_type == "coxian":
-                        t_val = float(self.log_tilde_A[jl, jpl0])
-                    else:
-                        # Include entry distribution
-                        t_val = float(self.log_tilde_A[jl, jpl0])
-                    log_p = float(jnp.logaddexp(jnp.array(log_p), jnp.array(t_val)))
-            log_probs.append(log_p)
-
-        log_probs = np.array(log_probs)
-        log_probs -= float(logsumexp(jnp.array(log_probs)))
-        pred_obs = int(np.argmax(log_probs))
-        return pred_obs, log_probs
+        return _predict_next_obs(self.log_tilde_A, self.log_tilde_pi, obs_seq,
+                                 self._c_eff, self.n_obs)
 
     def duration_pmf(self, macro_state, max_d=30):
         """Compute implied duration PMF P(D=d) for a given macro-state.
@@ -369,27 +356,29 @@ class SMCSCG(eqx.Module):
             log_state = np.full(L, float("-inf"))
             log_state[0] = 0.0
             for d in range(1, max_d + 1):
-                # At step d, prob of exiting (emitting duration d)
-                # = sum_l P(in phase l) * (1 - c[j,l])
+                # Prob of exiting at this step = sum_l P(phase l) * e[j,l]
                 log_exit = float("-inf")
                 for l in range(L):
-                    if l < L - 1:
-                        log_e_l = float(self.log_1mc[j, l])
-                    else:
-                        log_e_l = 0.0
                     log_exit = float(jnp.logaddexp(
                         jnp.array(log_exit),
-                        jnp.array(log_state[l] + log_e_l)
+                        jnp.array(log_state[l] + float(self.log_e[j, l]))
                     ))
                 pmf[d - 1] = np.exp(log_exit)
 
-                # Transition to next phase
+                # Propagate: stay in same phase or advance to next
                 new_log_state = np.full(L, float("-inf"))
-                for l in range(L - 1):
+                for l in range(L):
+                    # Stay
                     if log_state[l] > float("-inf"):
+                        new_log_state[l] = float(jnp.logaddexp(
+                            jnp.array(new_log_state[l]),
+                            jnp.array(log_state[l] + float(self.log_s[j, l]))
+                        ))
+                    # Advance
+                    if l < L - 1 and log_state[l] > float("-inf"):
                         new_log_state[l + 1] = float(jnp.logaddexp(
                             jnp.array(new_log_state[l + 1]),
-                            jnp.array(log_state[l] + self.log_c[j, l])
+                            jnp.array(log_state[l] + float(self.log_c[j, l]))
                         ))
                 log_state = new_log_state
 
@@ -502,25 +491,31 @@ class SMCSCG(eqx.Module):
             return self._m_step_general(log_xi_sum, log_gamma0_sum)
 
     def _m_step_coxian(self, log_xi_sum, log_gamma0_sum):
-        """M-step for Coxian phase-type."""
+        """M-step for Coxian phase-type with stay/advance/exit."""
         N = self.n_macro
         L = self.n_phases
         eps = max(self.pseudocount, 1e-300)
         log_eps = jnp.log(jnp.array(eps))
         xi = np.array(log_xi_sum)
 
+        new_log_s = np.full((N, L), float("-inf"))
         new_log_c = np.full((N, max(L - 1, 1)), float("-inf"))
-        new_log_1mc = np.full((N, max(L - 1, 1)), 0.0)
+        new_log_e = np.full((N, L), float("-inf"))
         new_log_A = np.full((N, N), float("-inf"))
 
         for j in range(N):
             for l in range(L):
                 jl = j * L + l
+
+                # Stay (self-loop)
+                log_stay = xi[jl, jl]
+
+                # Advance to next phase
                 if l < L - 1:
                     jl1 = j * L + l + 1
-                    log_cont = xi[jl, jl1]  # prob of staying (phase l -> l+1)
+                    log_adv = xi[jl, jl1]
                 else:
-                    log_cont = float("-inf")  # must exit
+                    log_adv = float("-inf")
 
                 # Exit: sum of xi to any other macro-state
                 log_exit_terms = []
@@ -535,19 +530,22 @@ class SMCSCG(eqx.Module):
                 else:
                     log_exit = float(log_eps)
 
+                # Normalize stay/advance/exit (or stay/exit for last phase)
                 if l < L - 1:
-                    # c = cont / (cont + exit)
-                    log_total = float(jnp.logaddexp(
-                        jnp.array(log_cont), jnp.array(log_exit)
-                    ))
-                    if log_total > float("-inf"):
-                        new_log_c[j, l] = log_cont - log_total
-                        new_log_1mc[j, l] = log_exit - log_total
-                    else:
-                        new_log_c[j, l] = float(jnp.log(jnp.array(0.5)))
-                        new_log_1mc[j, l] = float(jnp.log(jnp.array(0.5)))
+                    terms = jnp.array([log_stay, log_adv, log_exit])
+                    terms = jnp.logaddexp(terms, log_eps)
+                    log_total = logsumexp(terms)
+                    new_log_s[j, l] = float(terms[0] - log_total)
+                    new_log_c[j, l] = float(terms[1] - log_total)
+                    new_log_e[j, l] = float(terms[2] - log_total)
+                else:
+                    terms = jnp.array([log_stay, log_exit])
+                    terms = jnp.logaddexp(terms, log_eps)
+                    log_total = logsumexp(terms)
+                    new_log_s[j, l] = float(terms[0] - log_total)
+                    new_log_e[j, l] = float(terms[1] - log_total)
 
-                # Accumulate macro-transitions A[j, j'] = sum_l xi[jl, j'0] / sum_j' sum_l xi[jl, j'0]
+                # Accumulate macro-transitions
                 for jp in range(N):
                     if jp == j:
                         continue
@@ -569,7 +567,6 @@ class SMCSCG(eqx.Module):
         # Update initial distribution from gamma0
         new_log_pi = np.full(N, float("-inf"))
         for j in range(N):
-            # Sum gamma0 over phases
             g0_j = float("-inf")
             for l in range(L):
                 g0_j = float(jnp.logaddexp(
@@ -583,10 +580,10 @@ class SMCSCG(eqx.Module):
 
         # Build new model with updated params
         new_model = eqx.tree_at(
-            lambda m: (m.log_c, m.log_1mc, m.log_A, m.log_pi),
+            lambda m: (m.log_s, m.log_c, m.log_e, m.log_A, m.log_pi),
             self,
-            (jnp.array(new_log_c), jnp.array(new_log_1mc),
-             jnp.array(new_log_A), new_log_pi_arr),
+            (jnp.array(new_log_s), jnp.array(new_log_c),
+             jnp.array(new_log_e), jnp.array(new_log_A), new_log_pi_arr),
         )
         # Rebuild expanded matrices
         log_tilde_A, log_tilde_pi = new_model._build_expanded_params()

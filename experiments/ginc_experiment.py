@@ -30,6 +30,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import jax
+import jax.numpy as jnp
 from smcscg import CSCG
 from experiments.ginc_data import GINCDataset
 
@@ -41,7 +42,8 @@ def evaluate_prompts(model, prompts, true_labels, desc=""):
     report_every = max(1, n // 10)
     t0 = time.time()
     for i, (prompt, label) in enumerate(zip(prompts, true_labels)):
-        pred, _ = model.predict_next_obs(prompt)
+        log_probs = model.predict_next_obs(prompt)
+        pred = int(jnp.argmax(log_probs[-1]))
         if pred == label:
             correct += 1
         if (i + 1) % report_every == 0:
