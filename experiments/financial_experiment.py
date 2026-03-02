@@ -619,7 +619,7 @@ def main():
                         default=[2, 5])
     parser.add_argument("--n_iter", type=int, default=100)
     parser.add_argument("--tol", type=float, default=1e-4)
-    parser.add_argument("--pseudocount", type=float, default=1e-6,
+    parser.add_argument("--pseudocount", type=float, default=1.0,
                         help="Laplace smoothing for sufficient statistics")
 
     # Evaluation
