@@ -21,6 +21,7 @@ env/
 
 # Data files (generated)
 data/
+results/
 
 # Literature PDFs
 literature/

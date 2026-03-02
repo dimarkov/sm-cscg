@@ -157,7 +157,8 @@ def split_by_year(obs_seq, dates, min_train_years=5):
 # Model construction
 # ---------------------------------------------------------------------------
 
-def build_model_configs(n_obs, clone_counts, sm_phases, seed, pseudocount=1e-6):
+def build_model_configs(n_obs, clone_counts, sm_phases, seed, pseudocount=1e-6,
+                        mean_duration=None):
     """Build all CSCG and SM-CSCG model configurations.
 
     Returns list of dicts with 'name', 'model_type', 'n_clones', 'n_phases',
@@ -184,9 +185,9 @@ def build_model_configs(n_obs, clone_counts, sm_phases, seed, pseudocount=1e-6):
                 'model_type': 'smcscg',
                 'n_clones': c,
                 'n_phases': l,
-                'factory': lambda n=n_obs, nc=c, nl=l, k=key_int, pc=pseudocount: SMCSCG(
+                'factory': lambda n=n_obs, nc=c, nl=l, k=key_int, pc=pseudocount, md=mean_duration: SMCSCG(
                     n_obs=n, n_clones=nc, n_phases=nl, pseudocount=pc,
-                    key=jax.random.PRNGKey(k)),
+                    mean_duration=md, key=jax.random.PRNGKey(k)),
             })
 
     return configs
@@ -202,15 +203,35 @@ def compute_prediction_accuracy(model, obs_seq):
     predict_next_obs(obs_seq) returns (T, n_obs) where log_probs[t] gives
     P(x_{t+1} | x_{1:t}). We compare argmax predictions to true next tokens.
 
+    Returns overall accuracy, transition accuracy (only at regime changes),
+    and mean log-probability of the true next token.
+
     Returns
     -------
-    accuracy : float — fraction of correct next-token predictions
+    accuracy, transition_accuracy, mean_log_prob : float, float, float
     """
     log_probs = model.predict_next_obs(obs_seq)  # (T, n_obs)
     # log_probs[t] predicts obs at t+1, so compare [:-1] with obs[1:]
     predictions = jnp.argmax(log_probs[:-1], axis=1)
     true_next = jnp.asarray(obs_seq[1:], dtype=jnp.int32)
-    return float((predictions == true_next).mean())
+    correct = predictions == true_next
+    accuracy = float(correct.mean())
+
+    # Transition accuracy: only at points where obs changes
+    current = jnp.asarray(obs_seq[:-1], dtype=jnp.int32)
+    transition_mask = current != true_next
+    n_transitions = int(transition_mask.sum())
+    if n_transitions > 0:
+        transition_accuracy = float(correct[transition_mask].mean())
+    else:
+        transition_accuracy = float('nan')
+
+    # Mean log-prob of true next token (proper scoring rule)
+    # log_probs[:-1] has T-1 rows predicting obs[1:T], true_next has T-1 elements
+    true_log_probs = log_probs[jnp.arange(len(true_next)), true_next]
+    mean_log_prob = float(true_log_probs.mean())
+
+    return accuracy, transition_accuracy, mean_log_prob
 
 
 def compute_rolling_accuracy(model, obs_seq, window_sizes=(21, 63)):
@@ -259,7 +280,8 @@ def run_expanding_window(obs_seq, dates, model_configs, n_iter, tol,
             elapsed = time.time() - t0
 
             test_bps = float(model.bps(split['test_seq']))
-            pred_acc = compute_prediction_accuracy(model, split['test_seq'])
+            pred_acc, trans_acc, mean_lp = compute_prediction_accuracy(
+                model, split['test_seq'])
 
             results.append({
                 'config_name': cfg['name'],
@@ -271,12 +293,15 @@ def run_expanding_window(obs_seq, dates, model_configs, n_iter, tol,
                 'n_test_days': n_test,
                 'test_bps': test_bps,
                 'prediction_accuracy': pred_acc,
+                'transition_accuracy': trans_acc,
+                'mean_log_prob': mean_lp,
                 'n_iters': len(lls),
                 'elapsed_s': elapsed,
             })
 
             print(f"  {cfg['name']:<20s} ({len(lls):>3} it, {elapsed:>5.1f}s)  "
-                  f"BPS={test_bps:.4f}  Acc={pred_acc:.4f}")
+                  f"BPS={test_bps:.4f}  Acc={pred_acc:.4f}  "
+                  f"TransAcc={trans_acc:.4f}  MLP={mean_lp:.4f}")
 
     return results
 
@@ -338,9 +363,10 @@ def print_results_table(results, ticker_names):
     uniform_bps = np.log2(n_obs)
     chance_acc = 1.0 / n_obs
 
-    w = 85
+    w = 105
     header = (f"{'Config':<20s} {'Year':>4} {'Train':>5} {'Test':>4} "
-              f"{'BPS':>8} {'Accuracy':>8} {'Iters':>5} {'Time':>6}")
+              f"{'BPS':>8} {'Acc':>6} {'TransAcc':>8} {'MLP':>8} "
+              f"{'Iters':>5} {'Time':>6}")
     print(f"\n{'='*w}")
     print(f"RESULTS  (Uniform BPS = {uniform_bps:.4f}, Chance Acc = {chance_acc:.4f})")
     print("=" * w)
@@ -350,23 +376,27 @@ def print_results_table(results, ticker_names):
     for _, r in df.iterrows():
         print(f"{r['config_name']:<20s} {r['test_year']:>4d} "
               f"{r['n_train_days']:>5d} {r['n_test_days']:>4d} "
-              f"{r['test_bps']:>8.4f} {r['prediction_accuracy']:>8.4f} "
+              f"{r['test_bps']:>8.4f} {r['prediction_accuracy']:>6.4f} "
+              f"{r['transition_accuracy']:>8.4f} {r['mean_log_prob']:>8.4f} "
               f"{r['n_iters']:>5d} {r['elapsed_s']:>5.1f}s")
 
     # Aggregate summary
     print(f"\n{'='*w}")
     print("AGGREGATE (mean +/- std over test years)")
     print("=" * w)
-    agg_header = f"{'Config':<20s} {'BPS':>14} {'Accuracy':>14}"
+    agg_header = (f"{'Config':<20s} {'BPS':>14} {'TransAcc':>14} "
+                  f"{'MLP':>14}")
     print(agg_header)
     print("-" * w)
 
     for name in df['config_name'].unique():
         sub = df[df['config_name'] == name]
         bps_mean, bps_std = sub['test_bps'].mean(), sub['test_bps'].std()
-        acc_mean, acc_std = sub['prediction_accuracy'].mean(), sub['prediction_accuracy'].std()
+        tacc_mean, tacc_std = sub['transition_accuracy'].mean(), sub['transition_accuracy'].std()
+        mlp_mean, mlp_std = sub['mean_log_prob'].mean(), sub['mean_log_prob'].std()
         print(f"{name:<20s} {bps_mean:>6.4f} +/- {bps_std:<6.4f} "
-              f"{acc_mean:>6.4f} +/- {acc_std:<6.4f}")
+              f"{tacc_mean:>6.4f} +/- {tacc_std:<6.4f} "
+              f"{mlp_mean:>6.4f} +/- {mlp_std:<6.4f}")
 
 
 # ---------------------------------------------------------------------------
@@ -532,6 +562,8 @@ def run_experiment(args):
     prices = download_etf_data(args.tickers, start=args.start_date,
                                cache_dir=args.cache_dir)
     log_returns = compute_log_returns(prices)
+    if args.smooth_window > 1:
+        log_returns = log_returns.rolling(args.smooth_window, min_periods=1).mean()
     obs_seq, ticker_names = encode_observations(log_returns)
     dates = log_returns.index
     n_obs = len(ticker_names)
@@ -548,6 +580,7 @@ def run_experiment(args):
         sm_phases=args.sm_phases,
         seed=args.seed,
         pseudocount=args.pseudocount,
+        mean_duration=args.mean_duration,
     )
     print(f"\n--- Models: {len(model_configs)} configurations ---")
     for cfg in model_configs:
@@ -611,6 +644,8 @@ def main():
                         help="Start date for price data download")
     parser.add_argument("--cache_dir", type=str, default="data/financial",
                         help="Directory to cache downloaded price data")
+    parser.add_argument("--smooth_window", type=int, default=1,
+                        help="Rolling mean window for log returns before argmax (1=no smoothing)")
 
     # Models
     parser.add_argument("--clone_counts", type=int, nargs="+",
@@ -621,6 +656,8 @@ def main():
     parser.add_argument("--tol", type=float, default=1e-4)
     parser.add_argument("--pseudocount", type=float, default=1.0,
                         help="Laplace smoothing for sufficient statistics")
+    parser.add_argument("--mean_duration", type=float, default=None,
+                        help="Target mean duration for SM-CSCG phase-type init")
 
     # Evaluation
     parser.add_argument("--min_train_years", type=int, default=5,
@@ -645,12 +682,15 @@ def main():
         args.sm_phases = [2, 4]
         args.n_iter = 30
         args.min_train_years = 10
+        args.smooth_window = 10
 
     print("Financial Time Series Experiment: CSCG vs SM-CSCG")
     print(f"  Tickers:     {args.tickers}")
+    print(f"  Smooth window: {args.smooth_window}")
     print(f"  Clone counts: {args.clone_counts}")
     print(f"  SM phases:    {args.sm_phases}")
     print(f"  EM iters:     {args.n_iter}, tol={args.tol}, pseudocount={args.pseudocount}")
+    print(f"  Mean duration: {args.mean_duration}")
     print(f"  Min train years: {args.min_train_years}")
 
     run_experiment(args)

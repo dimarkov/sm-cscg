@@ -159,7 +159,8 @@ class SMCSCG(eqx.Module):
     pseudocount: float = eqx.field(static=True)
 
     def __init__(self, n_obs, n_clones, n_phases=5,
-                 phase_type="coxian", pseudocount=1e-6, key=None):
+                 phase_type="coxian", pseudocount=1e-6, mean_duration=None,
+                 key=None):
         self.n_obs = n_obs
         self.n_clones = n_clones
         self.n_phases = n_phases
@@ -187,13 +188,38 @@ class SMCSCG(eqx.Module):
         self.log_A = log_A
 
         if phase_type == "coxian":
-            # Three-way split per phase: stay / advance / exit
-            # For l < L-1: s + c + e = 1; for l == L-1: s + e = 1
-            raw = jax.random.exponential(keys[1], shape=(N, L, 3))
-            # Zero out advance weight for last phase
-            raw = raw.at[:, -1, 1].set(0.0)
-            row_sums = raw.sum(axis=2, keepdims=True)
-            probs = raw / row_sums  # (N, L, 3): [stay, advance, exit]
+            if mean_duration is not None and mean_duration > L:
+                # Initialize to target mean duration:
+                # stay prob s = 1 - L/mean_duration, split remaining into advance/exit
+                s_base = 1.0 - L / mean_duration
+                remain = 1.0 - s_base  # = L / mean_duration
+
+                # Non-last phases: 70% advance, 30% exit
+                probs_inner = np.zeros((N, L, 3))
+                probs_inner[:, :, 0] = s_base       # stay
+                probs_inner[:, :-1, 1] = 0.7 * remain  # advance (non-last)
+                probs_inner[:, :-1, 2] = 0.3 * remain  # exit (non-last)
+                probs_inner[:, -1, 1] = 0.0          # no advance for last phase
+                probs_inner[:, -1, 2] = remain        # all remaining to exit
+
+                # Add small random noise for symmetry breaking, then renormalize
+                noise = 0.02 * np.array(jax.random.uniform(keys[1], shape=(N, L, 3)))
+                noise[:, -1, 1] = 0.0  # keep advance=0 for last phase
+                probs = np.array(probs_inner) + noise
+                probs = probs / probs.sum(axis=2, keepdims=True)
+                probs = jnp.array(probs)
+            else:
+                if mean_duration is not None and mean_duration <= L:
+                    import warnings
+                    warnings.warn(
+                        f"mean_duration={mean_duration} <= n_phases={L}; "
+                        f"falling back to random init"
+                    )
+                # Original random init
+                raw = jax.random.exponential(keys[1], shape=(N, L, 3))
+                raw = raw.at[:, -1, 1].set(0.0)
+                row_sums = raw.sum(axis=2, keepdims=True)
+                probs = raw / row_sums  # (N, L, 3): [stay, advance, exit]
 
             self.log_s = jnp.log(probs[:, :, 0])                # (N, L)
             self.log_c = jnp.log(probs[:, :L - 1, 1])           # (N, L-1)
@@ -210,7 +236,19 @@ class SMCSCG(eqx.Module):
             )
             # Sub-transition matrix: sub-stochastic rows
             raw_S = jax.random.exponential(keys[3], shape=(N, L, L))
-            stay_frac = 0.3 + 0.5 * jax.random.uniform(keys[4], shape=(N, L, 1))
+            if mean_duration is not None and mean_duration > L:
+                # Derive stay_frac from target mean duration (+ small noise)
+                base = 1.0 - L / mean_duration
+                noise = 0.05 * jax.random.uniform(keys[4], shape=(N, L, 1))
+                stay_frac = jnp.clip(base + noise, 0.1, 0.99)
+            else:
+                if mean_duration is not None and mean_duration <= L:
+                    import warnings
+                    warnings.warn(
+                        f"mean_duration={mean_duration} <= n_phases={L}; "
+                        f"falling back to random init"
+                    )
+                stay_frac = 0.3 + 0.5 * jax.random.uniform(keys[4], shape=(N, L, 1))
             row_norms = logsumexp(jnp.log(raw_S), axis=2, keepdims=True)
             self.log_S = jnp.log(raw_S) - row_norms + jnp.log(stay_frac)
             # Unused Coxian params (dummy)
